@@ -1,3 +1,4 @@
+import argparse
 import csv
 import os
 from dataclasses import dataclass
@@ -268,7 +269,123 @@ class LiveStats:
         return Panel(body, title="Final", border_style="green", padding=(1, 2))
 
 
-def run_tests(examples: list[Example]):
+# --------------------------------------------------------------------------- #
+# Results export + plot
+# --------------------------------------------------------------------------- #
+
+# semantic colours, matching the OK / PARTIAL / MISS scheme of the dashboard
+OK_COLOR = "#2f9e44"       # Correct - green
+PARTIAL_COLOR = "#f08c00"  # Partial - amber
+MISS_COLOR = "#e03131"     # Miss    - red
+
+# CSV column order is fixed: type,count with these row labels
+_CSV_FIELDS = ("Correct", "Partial", "Miss")
+
+
+def save_results_csv(found: int, partial: int, miss: int, path: str = "results.csv") -> None:
+    """Write the tally as `type,count` (rows: Correct, Partial, Miss)."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["type", "count"])
+        writer.writerow(["Correct", found])
+        writer.writerow(["Partial", partial])
+        writer.writerow(["Miss", miss])
+
+
+def load_results_csv(path: str = "results.csv") -> tuple[int, int, int]:
+    """Read a `type,count` results CSV back into (found, partial, miss)."""
+    counts = {"Correct": 0, "Partial": 0, "Miss": 0}
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or "type" not in reader.fieldnames or "count" not in reader.fieldnames:
+            raise ValueError(f"{path!r} must have a 'type,count' header")
+        for row in reader:
+            key = (row["type"] or "").strip()
+            if key in counts:
+                counts[key] = int(row["count"])
+    return counts["Correct"], counts["Partial"], counts["Miss"]
+
+
+def _draw_brace(ax, x0, x1, y, text, *, color="#343a40", lw=1.6,
+                       depth=0.22, text_gap=0.12, fontsize=12):
+    if x1 <= x0:
+        return
+
+    # Define the 4 points of the square bracket
+    x_coords = [x0, x0, x1, x1]
+    y_coords = [y, y - depth, y - depth, y]
+
+    # Draw the bracket (note the corrected solid_joinstyle)
+    ax.plot(x_coords, y_coords, color=color, lw=lw, clip_on=False,
+            solid_capstyle="round", solid_joinstyle="miter")
+
+    # Add the centered text
+    ax.text((x0 + x1) / 2.0, y - depth - text_gap, text,
+            ha="center", va="top", fontsize=fontsize, color=color, fontweight="bold")
+
+
+def plot_results(found: int, partial: int, miss: int, path: str = "results.png",
+                 *, title: str | None = None) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not installed; skipping plot "
+              "(install with: pip install matplotlib)")
+        return
+
+    total = found + partial + miss
+    denom = total or 1
+
+    fig, ax = plt.subplots(figsize=(9.5, 2.6))
+
+    segments = [
+        ("Perfect match", found, OK_COLOR),
+        ("Partial match", partial, PARTIAL_COLOR),
+        ("Miss", miss, MISS_COLOR),
+    ]
+
+    bar_y, bar_h = 0.0, 0.6
+    left = 0
+    for _label, count, color in segments:
+        if count <= 0:
+            continue
+        ax.barh(bar_y, count, left=left, height=bar_h, color=color,
+                edgecolor="white", linewidth=1.5, zorder=3)
+        pct = 100.0 * count / denom
+        # only label inside the segment if there's room; otherwise skip
+        if count / denom >= 0.04:
+            ax.text(left + count / 2.0, bar_y, f"{_label}: {count}\n({pct:.0f}%)",
+                    ha="center", va="center", color="white",
+                    fontsize=12, fontweight="bold", zorder=4)
+        left += count
+
+    # brace under Correct + Partial, labelled with their sum
+    good = found + partial
+    if good > 0:
+        _draw_brace(ax, 0, good, bar_y - bar_h / 2 - 0.06,
+                    f"Result found: {good} \n({100.0 * good / denom:.0f}%)")
+
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c) for _, _, c in segments]
+
+
+    ax.set_xlim(0, denom)
+    ax.set_ylim(-1.15, bar_h / 2 + 0.1)
+    ax.set_yticks([])
+    ax.set_xlabel("Test cases", fontsize=12)
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
+    ax.tick_params(axis="x", labelsize=10)
+    plt.title("Laminar 3.0 advanced search accuracy", fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved plot -> {path}")
+
+
+def run_tests(examples: list[Example], *, csv_path: str = "results.csv",
+              plot_path: str | None = "code_search_accuracy.pdf"):
     from laminar.client.d4pyclient import d4pClient
 
     console = Console()
@@ -289,9 +406,40 @@ def run_tests(examples: list[Example]):
 
     console.print(stats.final_summary())
 
+    # persist + visualise
+    save_results_csv(stats.found, stats.partial, stats.miss, csv_path)
+    console.print(f"Saved results -> {csv_path}")
+    if plot_path:
+        plot_results(stats.found, stats.partial, stats.miss, plot_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run the advanced-search eval, export a type,count CSV "
+                    "and a stacked-bar plot of Correct / Partial / Miss."
+    )
+    parser.add_argument("dataset", nargs="?", default="dataset.csv",
+                        help="input examples CSV (default: dataset.csv)")
+    parser.add_argument("--csv", default="results.csv",
+                        help="path for the type,count results CSV (default: results.csv)")
+    parser.add_argument("--plot", default="code_search_accuracy.pdf",
+                        help="path for the plot; format from extension, "
+                             ".png/.pdf/.svg (default: code_search_accuracy.pdf)")
+    parser.add_argument("--plot-only", action="store_true",
+                        help="skip the evaluation; read --csv and just render the plot")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="run the eval and write the CSV, but don't render a plot")
+    args = parser.parse_args()
+
+    if args.plot_only:
+        found, partial, miss = load_results_csv(args.csv)
+        plot_results(found, partial, miss, args.plot)
+        return
+
+    examples = load(args.dataset)
+    run_tests(examples, csv_path=args.csv,
+              plot_path=None if args.no_plot else args.plot)
+
 
 if __name__ == "__main__":
-    import sys
-
-    path = sys.argv[1] if len(sys.argv) > 1 else "dataset.csv"
-    run_tests(load(path))
+    main()
