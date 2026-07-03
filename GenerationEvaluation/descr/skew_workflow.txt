@@ -1,0 +1,38 @@
+This task is to build a data-processing workflow using dispel4py, a Python
+framework for describing stream-based pipelines as a graph of connected
+processing elements. In dispel4py each stage is a processing element that
+declares named input and output ports, data flows one item at a time along the
+connections wired between those ports, and the assembled graph is what gets
+executed. The workflow to build generates random numbers, keeps only the ones
+that are prime, and prints them. It is a short straight-line pipeline of three
+stages: a source that produces numbers, a middle stage that tests each number
+for primality and lets only primes through, and a sink that prints each prime it
+receives.
+
+The first stage is a pure source with no input of its own. Each time it runs it
+produces a single random integer between 1 and 1000 and emits it downstream, so
+over a run it generates a stream of independent random values. Before producing
+each number it also pauses for a short, randomly drawn amount of time that is
+deliberately skewed toward very small delays — most waits are near zero but
+occasionally longer, up to around half a second. This uneven pacing is
+intentional and models a bursty, skewed production rate; it affects only timing,
+not the numbers themselves, so it can be treated as an artificial delay rather
+than part of the computation's result.
+
+The second stage receives one number at a time and decides whether it is prime.
+It also keeps an internal counter of how many numbers it has examined,
+incrementing it on each arrival and logging a note that records the number being
+checked and the running count. To decide primality it tests whether the number
+has any divisor among the integers from two up to just below the number itself;
+if none divides it evenly the number is considered prime and is passed through
+unchanged to the next stage, and if it is not prime the stage emits nothing and
+the number is simply dropped. In this way only prime numbers continue down the
+pipeline.
+
+The final stage is a sink that consumes each prime number it receives and prints
+a short message announcing that the number is prime. It produces no further
+output and terminates the pipeline.
+
+The three stages are connected in order — source into the primality tester, and
+the primality tester into the printing sink — forming the complete pipeline that
+turns a stream of random integers into printed reports of just the prime ones.

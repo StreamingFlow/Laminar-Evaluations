@@ -8,3 +8,4 @@ langchain-community==0.3.27
 langchain-openai==0.2.14
 langchain-text-splitters==0.3.11
 instructor==1.9.2
+continuous-eval==0.3.14.post2
