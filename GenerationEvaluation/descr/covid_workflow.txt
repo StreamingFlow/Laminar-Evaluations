@@ -5,7 +5,7 @@ linear three-stage pipeline: a data source feeds a per-record transformer, and
 the transformer feeds a collector that does the plotting. Data flows one daily
 record at a time from the first stage to the last.
 
-The first stage is the data source, a GenericPE. It is given the URL of a JSON endpoint that
+The first stage is the data source, a GenericPE. It is given the URL in its __init__ of a JSON endpoint that
 serves national COVID-19 statistics for India, and when it runs it opens that
 URL, downloads the response, and parses it as JSON.
 
@@ -14,7 +14,7 @@ one at a time and pulls out just the two pieces of information the chart needs.
 From each record it reads the date field and
 parses it into a proper date object so it can be plotted on a time axis.
 
-The final third stage is the collector and visualizer, set up so that every record in the
+The final third stage is a generic PE implementing the collector and visualizer, set up so that every record in the
 stream is funneled into a single instance of it rather than being
 spread across parallel workers. This PE is not iterative as it needs to collect all
 data to then visualize it with matplotlib.
