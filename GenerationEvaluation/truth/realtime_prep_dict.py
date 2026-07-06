@@ -12,7 +12,7 @@ class StreamRead(IterativePE):
 
     def _process(self, filename):
         raise NotImplementedError('   business logic is intentionally unimplemented')
-        3
+
 
 
 class StreamToFile(ConsumerPE):
@@ -26,9 +26,8 @@ class StreamToFile(ConsumerPE):
 
 class Decimate(IterativePE):
 
-    def __init__(self, sps):
+    def __init__(self):
         IterativePE.__init__(self)
-        self.sps = sps
 
     def _process(self, data):
         raise NotImplementedError('   business logic is intentionally unimplemented')
@@ -110,7 +109,7 @@ calNorm = CalculateNorm()
 whiten = Whiten()
 calcFft = CalculateFft()
 
-graph.connect(streamRead, StreamRead.OUTPUT_NAME, decim, 'input')
+graph.connect(streamRead, 'output', decim, 'input')
 graph.connect(decim, 'output', detrend, 'input')
 graph.connect(detrend, 'output', demean, 'input')
 graph.connect(demean, 'output', removeResponse, 'input')
@@ -118,4 +117,4 @@ graph.connect(removeResponse, 'output', filt, 'input')
 graph.connect(filt, 'output', calNorm, 'input')
 graph.connect(calNorm, 'output', whiten, 'input')
 graph.connect(whiten, 'output', calcFft, 'input')
-graph.connect(calcFft, 'output', streamToFile, StreamToFile.INPUT_NAME)
+graph.connect(calcFft, 'output', streamToFile, 'input')

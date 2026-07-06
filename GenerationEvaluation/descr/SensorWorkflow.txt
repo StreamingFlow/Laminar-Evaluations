@@ -1,50 +1,32 @@
-This task is to build a data-processing workflow using dispel4py, a Python
-framework for describing stream-based pipelines as a graph of connected
-processing elements. In dispel4py each stage is a processing element that
-declares named input and output ports, data flows one item at a time along the
-connections wired between those ports, and the assembled graph is what gets
-executed. The workflow to build ingests a file of temperature sensor readings,
+A workflow to build ingests a file of temperature sensor readings,
 normalizes and inspects each reading for anomalies, raises alerts when a reading
 looks abnormal, and periodically reports a rolling average. It is a single
 straight-line pipeline of five stages, one feeding the next, with each sensor
 reading passing through the whole chain as a small record that later stages
 enrich with extra fields.
 
-The pipeline begins with a source stage that has no upstream input and instead
-reads from a file whose path it is given. That file is a JSON document
-containing one big array of reading objects, where each object has a timestamp
-string and a numeric temperature. The source loads the entire file at once and
+The pipeline begins with a producer stage that has no upstream input and instead
+reads from a JSON file whose path it is given. The source loads the entire file at once and
 then walks the array, emitting one reading at a time downstream. For each
 reading it emits a small record carrying just the timestamp and the temperature,
-with the temperature coerced to a floating-point number. So the rest of the
-pipeline sees a stream of individual timestamped temperature readings.
+with the temperature coerced to a floating-point number.
 
-The second stage normalizes each reading. It takes the temperature and rescales
-it to a value between zero and one, assuming an expected operating range from 0
-to 40 degrees Celsius, so a reading is divided by forty to land on that
-zero-to-one scale. It adds this normalized temperature to the record as a new
-field and passes the enriched record along, leaving the original timestamp and
-raw temperature intact.
+The second stage iteratively normalizes each reading normalizing and rescaling the temperature
+it to a value between zero and one, It adds this normalized temperature to the record as a new
+field and emits it downstream.
 
-The third stage detects anomalies using a simple running-average rule. It keeps
-a growing list of every normalized temperature it has seen so far. For each new
-reading it appends the normalized value, computes the mean of all normalized
+The third stage iteratively detects anomalies using a simple running-average rule.
+For each new reading it appends the normalized value, computes the mean of all normalized
 values seen up to that point, and then compares the current normalized value
-against that running mean. If the current value differs from the running mean by
-more than a configurable threshold — with a small default such as one tenth — it
-marks the record as an anomaly by adding a boolean flag set to true; otherwise
-it adds the flag set to false. Either way the record, now carrying the anomaly
-flag, is passed onward.
+against that running mean. It emits the original data enriched with a boolean flag set to true
+if an anomaly is detected.
 
-The fourth stage handles alerting. It inspects the anomaly flag on each record,
-and whenever the flag is true it prints an alert message that names the reading's
-timestamp along with its raw and normalized temperatures, so anomalous readings
-are surfaced as they occur. Records that are not anomalies produce no alert. In
+The fourth stage iteratively handles alerting. If an anomaly is detected it prints to screen a warning. In
 all cases the record is passed through unchanged to the final stage, so alerting
 observes and reports but does not filter the stream.
 
-The final stage is a sink that aggregates. It accumulates the raw temperatures
-of the readings flowing into it, and every time it has collected five readings
+The final stage is a sink consumer that aggregates the raw temperatures
+of the readings flowing into it. and every time it has collected five readings
 it computes and prints the average temperature of that batch of five, then
 clears its buffer to begin the next batch. This produces a periodic rolling
 report of average temperature for every five consecutive readings and consumes

@@ -1,75 +1,26 @@
-This task is to build a data-processing workflow using dispel4py, a Python
-framework for describing stream-based pipelines as a graph of connected
-processing elements. In dispel4py each stage is a processing element that
-declares named input and output ports, data flows one item at a time along the
-connections wired between those ports, and the assembled graph is what gets
-executed. The workflow to build is an astronomy pipeline that reads a list of
-sky coordinates, looks up each coordinate in an online astronomical catalog,
-extracts a couple of properties for each object, and finishes by computing an
-"internal extinction" value for each galaxy. It is a single straight-line
-pipeline of four stages, one feeding the next, with a single record for each
-coordinate flowing through the whole chain and accumulating results as it goes.
-A defining feature of this particular version is that two of the middle stages
-deliberately insert randomized, unevenly distributed processing delays, so that
-the per-item work is intentionally skewed in duration; this is used to create an
-uneven workload for studying how the pipeline behaves under load, and to make
-those delays repeatable the workflow fixes the random number generator's seed at
-the start so the same sequence of delays occurs on every run. The delays affect
-only timing and never change the scientific results.
+A workflow to build an astronomy pipeline that reads a list of sky coordinates, looks up each coordinate in an online
+astronomical catalog, extracts a couple of properties for each object, and finishes by computing an "internal extinction"
+value for each galaxy. It is a single straight-line pipeline of four stages, one feeding the next, with a single
+record for each coordinate flowing through the whole chain and accumulating results as it goes. The stages do their
+scientific work as fast as they can, with no artificial pacing or delays anywhere in the pipeline.
 
-The first stage is a reader with no upstream input; instead it is given the path
-to a text file of coordinates. It opens that file and reads it line by line,
-where each line holds a right ascension and a declination separated by a comma.
-It keeps a running line counter, and for each line it strips and splits the two
-coordinate values and emits a small record downstream containing that line
-number, the right ascension, the declination, and a fixed search radius (a small
-value such as 0.001) that will be used when querying the catalog. This stage
-applies no artificial delay of its own; it simply turns a coordinate file into a
-stream of individual coordinate records, each tagged with a sequence number and
-a search radius.
+The first stage is a generic reader with no upstream input; it is given the path to a text file of coordinates.
+It opens that file and reads it line by line, keeping a running line counter, and for each line it strips and
+splits the two coordinate values and emits a small record downstream.
 
-The second stage takes each coordinate record and retrieves catalog data for it
-over the network. Before making the request it pauses for a randomly drawn
-amount of time whose length is deliberately skewed: the delay is sampled from a
-Beta distribution with shape parameters 2 and 5 (which concentrates the draws
-toward the low end) and then scaled up by a factor of two, so most requests wait
-only a short while but some wait noticeably longer. After that pause it builds a
-query to an online astronomical catalog service (a VizieR VOTable endpoint for a
-particular catalog source) using the record's right ascension, declination, and
-search radius, performs an HTTP GET request, and passes onward a record
-containing the original line number, right ascension, declination, and the raw
-VOTable XML text that came back from the service.
+The second stage iteratively takes each coordinate record and retrieves catalog data for it over the network.
+It builds a query to an online astronomical catalog service (a VizieR VOTable endpoint for a particular catalog source),
+performs the request, and passes onward the original input of the PE together with the result that came back
+from the service.
 
-The third stage parses that catalog response and pulls out just the columns of
-interest. It too begins with a deliberately skewed pause, this time drawn from
-the same shape of Beta distribution (shape parameters 2 and 5) but left
-unscaled, so its delays are on average shorter than the previous stage's but
-skewed in the same way. It then parses the returned VOTable XML into a table and
-attempts to read two specific columns from the first (and assumed only) row: the
-object's morphological type and the logarithm of its axis ratio (often written
-as logR25). For each of the two columns it takes the first row's value, converts
-any 32-bit float to an ordinary Python float so the value can be serialized
-cleanly, and substitutes a null value if the column is missing or cannot be
-read. It then emits a record carrying the line number, right ascension,
-declination, and those two extracted properties.
+The third stage iteratively parses that catalog response and pulls out just the columns of interest. It reads the
+input stream, converts the values into Python-serializable objects, and then emits a record carrying the line number,
+right ascension, declination, and those two extracted properties.
 
-The fourth stage computes the internal extinction of each galaxy from those two
-properties, without any artificial delay of its own. It holds a fixed lookup
-table mapping morphological type labels (such as elliptical and spiral
-classifications like E, S0, Sa, Sb, Sc and their barred variants) to numeric
-type codes, defaulting to a sentinel numeric code when a label is not
-recognized. Using the numeric type code and the axis-ratio logarithm, together
-with a fixed physical constant, it evaluates an astrophysics formula that yields
-the internal extinction value for that galaxy. It emits a final record
-containing the line number, right ascension, declination, the morphological
-type, the axis-ratio logarithm, the numeric type code, and the computed
-extinction value. If the calculation fails for a given object — for example
-because a required input was missing — that record is quietly skipped and
-nothing is emitted for it.
+The fourth stage iteratively computes the internal extinction of each galaxy from those two properties, using a
+fixed lookup table mapping morphological type labels to numeric type codes and defaulting to a sentinel numeric
+code when a label is not recognized. It emits a final record containing the converted data, emitting output on error.
 
-The four stages are connected in order — coordinate reader into catalog lookup,
-catalog lookup into column extractor, and column extractor into the extinction
-calculator — forming the complete pipeline that turns a file of sky coordinates
-into per-galaxy internal-extinction results, with the two catalog-facing middle
-stages carrying the deliberately skewed timing delays that give this version of
-the workflow its uneven, load-testing character.
+The four stages are connected in order — coordinate reader into catalog lookup, catalog lookup into column extractor,
+and column extractor into the extinction calculator — forming the complete pipeline that turns a file of sky coordinates
+into per-galaxy internal-extinction results.

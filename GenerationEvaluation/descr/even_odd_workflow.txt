@@ -1,54 +1,34 @@
-This task is to build a data-processing workflow using dispel4py, a Python
-framework for describing stream-based pipelines as a graph of connected
-processing elements. In dispel4py each stage is a processing element that
-declares named input and output ports, data flows one item at a time along the
-connections wired between those ports, and the assembled graph is what gets
-executed. The workflow to build generates random numbers and pairs
+a workflow to build generates random numbers and pairs
 them up, matching each odd number with an even one. The idea is a small pipeline
 that produces a stream of integers, splits that stream into two filtered
-branches — one carrying only even numbers, the other only odd — and then brings
+branches (one carrying only even numbers, the other only odd) and then brings
 the two branches back together in a final stage that couples them into
 (odd, even) pairs. It is a fan-out-then-merge shape rather than a straight line:
 one source, two parallel filters fed from that same source, and one collector
 that has a separate input for each branch.
 
-The first stage is a pure source with no input of its own. Every time it runs it
-produces a single random integer somewhere between 1 and 1000 and emits it. Each
-invocation yields exactly one number, so over the course of a run it generates a
-stream of independent random values flowing downstream.
+The first stage is a pure producer with no input of its own. Every time it runs it
+produces a single random integer somewhere between 1 and 1000 and emits it.
 
-That stream then has to be sorted by parity, and the workflow does this in a
-deliberately economical way: it defines a single filter component that decides
-whether a number matches a target parity, and it instantiates that same
-component twice with different settings rather than writing two separate filters.
-The filter takes a number, divides it by two, and looks at the remainder; it is
-configured at creation time with the remainder it should accept — zero for even
-numbers, one for odd. If the number's remainder matches the configured target it
+The second stage is an iterative filter divider. It is instantiated into two different
+Processing elements, one to check for pair numbers and one to check for odd numbers.
+The remainder to check is provided in the __init__method and is set at instantiation.
+The filter takes a number, divides it by two, and looks at the remainder.
+If the number's remainder matches the configured target it
 passes the number through unchanged; if not, it emits nothing and the number is
-simply dropped. So one copy of this filter, set to accept remainder zero, becomes
-the "evens only" branch, and a second copy, set to accept remainder one, becomes
-the "odds only" branch. Crucially, the source's single output is connected to
+simply dropped. Crucially, the first stage single output is connected to
 both filter copies at once, meaning both branches receive a copy of the very same
 stream of random numbers and each keeps only the numbers that suit it.
 
-The final stage is the collector that does the pairing, and it is built with two
-distinct, separately named inputs — one for the odd branch and one for the even
-branch — plus a single output. Internally it keeps two running lists, one for odd
+The final stage is the generic collector implementing the final PE  that pairs numbers together,
+and it is built with two distinct, separately named inputs (one for the odd branch and one for the even
+branch) plus a single output. Internally it keeps two running lists, one for odd
 numbers received and one for even numbers received. Whenever a number arrives it
 is appended to whichever list corresponds to the input it came in on. After each
 arrival the stage checks whether it can form a pair: as long as both lists have
-at least one number waiting, it takes the oldest number from each list, prints
-that odd-even pair, emits the pair as a two-element tuple on its output, and
-removes both numbers from their lists. It keeps forming pairs this way until one
-of the two lists runs dry, then waits for more input. Because the source produces
-odds and evens at random, one list will usually run ahead of the other, so some
-numbers never find a partner. To handle that, the stage has a wrap-up step that
-runs a single time after all input has been processed, in which it reports
-whatever odd and even numbers were left over and unpaired, and then clears both
-lists.
+at least one number waiting, it takes the oldest number from each list and prints
+that odd-even pair.
 
-Wiring it all together: the source connects to both parity filters; the even
+The workflow is then connected in this way: the source connects to both parity filters; the even
 filter's output feeds the collector's even input; and the odd filter's output
-feeds the collector's odd input. The end result is a workflow that turns a stream
-of random integers into a stream of neatly matched odd-even pairs, while keeping
-track of and announcing any numbers that couldn't be paired.
+feeds the collector's odd input.

@@ -1,91 +1,36 @@
-This task is to build a data-processing workflow using dispel4py, a Python
-framework for describing stream-based pipelines as a graph of connected
-processing elements. In dispel4py each stage is a processing element that
-declares named input and output ports, data flows one item at a time along the
-connections wired between those ports, and the assembled graph is what gets
-executed. The workflow to build is a seismology pipeline that preprocesses
-ground-motion recordings for a set of stations, applying the standard chain of
-signal-conditioning steps used before cross-correlation studies (of the kind
-used for ambient-noise seismology), and writing the processed result for each
-station to disk. Its defining characteristic is that the seismic waveform data
-is never passed between stages as a native waveform object; instead, at every
-stage boundary the waveform is represented as a plain, serialization-friendly
-dictionary of numbers and strings. Each processing stage reconstructs a working
-waveform object from that dictionary when it starts, does its work, and converts
-the waveform back into a dictionary before emitting it. This is done so the data
-crossing between stages is always something that can be cleanly serialized (for
-example to JSON) and shipped between distributed workers, since the rich
-waveform objects themselves do not serialize reliably.
+A workflow to build a seismology pipeline that preprocesses ground-motion recordings for a set of stations, applying the
+ standard chain of signal-conditioning steps used before cross-correlation studies (of the kind used for ambient-noise
+ seismology), and writing the processed result for each station to disk. It is a single long straight-line pipeline: a
+ reader loads each station's waveform data, a sequence of signal-processing stages transform it one after another, and
+ a final sink saves the result. The unit of data flowing through the pipeline is a small bundle for each station that
+ pairs the waveform data (a multi-trace seismic stream) with identifying metadata, and each processing stage modifies
+ the waveform in place within that bundle while carrying the metadata along untouched.
 
-To make that possible the workflow relies on a small set of conversion helpers
-that must be defined once and reused throughout: one that turns a multi-trace
-waveform stream into a dictionary — recording, for each trace, its metadata
-(network, station, location, channel, start time, sampling rate, sample spacing,
-and sample count) alongside the raw samples converted from a numeric array into
-an ordinary list — and an inverse that rebuilds a waveform stream from such a
-dictionary. There is a matching pair for Fourier-transform output, which is made
-of complex numbers: one helper turns a sequence of complex values into a list of
-plain records each holding a real part and an imaginary part, and its inverse
-rebuilds the complex-valued array from that list. Every stage that touches the
-waveform uses the dictionary-to-stream helper on the way in and the
-stream-to-dictionary helper on the way out.
+The pipeline begins with an iterative reader that is given the path to a text file listing stations. For each station
+the reader searches an input directory and reads its seismic stream data, emitting the waveform stream together with
+the station name, the counter, and the network code.
 
-The pipeline is a single long straight line. The unit of data flowing through it
-is a small bundle for each station that pairs the waveform — in its dictionary
-form — with identifying metadata: the station name, a counter extracted from the
-source filename, and the network code. Each processing stage modifies the
-waveform within that bundle and carries the metadata along untouched.
+From there the waveform passes through a fixed sequence of iterative conditioning stages, each taking the bundle,
+operating on the waveform it contains, and passing the bundle onward. First a decimation stage downsamples the waveform
+to a target sampling rate. Next a detrend stage removes a simple linear trend from the waveform, and then a demean
+stage removes its mean offset. After that a response-removal stage reads the station's instrument-response, returning
+only the unit measurement. A bandpass filter stage then restricts the waveform to a chosen frequency band, configured
+by minimum and maximum frequencies, a number of filter corners, and whether the filtering is zero-phase.
 
-It begins with a reader that is given the path to a text file listing stations,
-one per line, each naming a network and a station. For each station the reader
-searches an input directory for the matching waveform file (a miniSEED file whose
-name encodes the network, station, and a counter), reads its waveform data if
-found, extracts the counter from the filename, immediately converts the waveform
-into its dictionary form, and emits a bundle of that dictionary plus the station
-name, counter, and network. Missing stations are logged and skipped.
+The waveform then goes through iterative amplitude normalization and spectral whitening. The normalization stage
+supports several temporal-normalization methods selected by a parameter. The whitening stage flattens the amplitude
+spectrum by dividing the signal's spectrum by a smoothed version of its own amplitude spectrum.
 
-From there the waveform passes through a fixed sequence of conditioning stages,
-each of which first rebuilds a waveform object from the incoming dictionary,
-operates on it, then converts it back to a dictionary before passing the bundle
-on. A decimation stage downsamples the waveform to a target sampling rate (for
-example four samples per second), splitting the decimation into two successive
-factor steps when the required ratio is large (greater than sixteen) and doing it
-in one step otherwise. A detrend stage removes a simple linear trend, and a
-demean stage removes the mean offset. A response-removal stage reads the
-station's instrument-response inventory from an XML file in the input directory
-and deconvolves the instrument response, outputting velocity units after applying
-a pre-filter band defined by four corner frequencies. A bandpass filter stage
-then restricts the waveform to a chosen frequency band, configured by minimum and
-maximum frequencies, a number of corners, and a zero-phase flag. A normalization
-stage supports several temporal-normalization methods — one-bit,
-running-absolute-mean, gain-style, and envelope normalization — selected by a
-parameter with envelope normalization as the default and a window-length
-parameter for smoothing. A whitening stage flattens the amplitude spectrum by
-dividing the signal's spectrum by a smoothed version of its own amplitude
-spectrum, controlled by a smoothing parameter and acting as a pass-through when
-that parameter is left unset.
+After that an iterative transform stage computes the Fourier transform of the conditioned trace, casting the samples
+to a chosen numeric precision, and emitting the transformed data together with the station name and counter.
 
-The transform stage then computes the Fourier transform of the conditioned
-trace: it rebuilds the waveform from its dictionary, casts the samples to a
-chosen numeric precision, chooses a transform length as the next power of two
-above a size derived from the data length and a shift parameter, computes the
-FFT, and — because the result is complex-valued — converts that result into the
-list-of-real-and-imaginary-parts form before emitting it along with the station
-name and counter.
+The final stage is a consumer that writes results to disk, constructing an output directory path built from a fixed
+root directory, a data subfolder, a start-time label, and the station name, and then saving the processed data to a
+file named from the station and counter. It produces no further output and terminates the pipeline.
 
-The final stage is a sink that writes results to disk. It first rebuilds the
-complex-valued transform result from its list form, then constructs an output
-directory path from a fixed root directory, a data subfolder, a start-time label,
-and the station name, creating those directories if needed, and saves the
-processed data to a file named from the station and counter. It produces no
-further output and ends the pipeline.
-
-The stages are connected in one long chain in exactly this order — reader,
-decimation, detrend, demean, response removal, bandpass filter, normalization,
-whitening, Fourier transform, and finally the file-writing sink — with the
-waveform represented as a serialization-friendly dictionary at every boundary
-between them. Configuration values are fixed in the assembly: a target of four
-samples per second for decimation, a pre-filter band and velocity output units
-for response removal, default bandpass settings, envelope normalization with a
-modest window length, whitening left disabled, and a double-precision FFT with a
-fixed shift.
+The stages are connected in one long chain in exactly this order — reader, decimation, detrend, demean, response
+removal, bandpass filter, normalization, whitening, Fourier transform, and finally the file-writing sink — forming
+the complete pipeline that turns a list of stations into preprocessed, saved waveform products. Configuration
+values are fixed in the assembly: a target of four samples per second for decimation, a pre-filter band and velocity
+output units for response removal, default bandpass settings, envelope normalization with a modest window length,
+whitening left disabled, and a double-precision FFT with a fixed shift.

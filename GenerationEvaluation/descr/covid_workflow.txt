@@ -1,52 +1,23 @@
-This task is to build a data-processing workflow using dispel4py, a Python
-framework for describing stream-based pipelines as a graph of connected
-processing elements. In dispel4py each stage is a processing element that
-declares named input and output ports, data flows one item at a time along the
-connections wired between those ports, and the assembled graph is what gets
-executed. The workflow to build fetches COVID-19 case data from a
+A workflow to build fetches COVID-19 case data from a
 public web API, reshapes it record by record, and finishes by drawing a time
-series chart of daily new cases which it saves as an image. It is a simple,
+series chart of daily new cases which it saves as an image. I want a simple,
 linear three-stage pipeline: a data source feeds a per-record transformer, and
 the transformer feeds a collector that does the plotting. Data flows one daily
 record at a time from the first stage to the last.
 
-The first stage is the data source. It is given the URL of a JSON endpoint that
+The first stage is the data source, a GenericPE. It is given the URL of a JSON endpoint that
 serves national COVID-19 statistics for India, and when it runs it opens that
-URL, downloads the response, and parses it as JSON. The payload contains a
-time-series array holding one entry per day, and the stage walks through that
-array and emits each daily entry, in turn, on its single output. Each entry it
-sends downstream is the raw per-day record as it came from the API, still a
-dictionary with the original fields intact — importantly the calendar date of
-the record and the cumulative-or-daily counts it carries. This stage has no
-input; it is purely a producer that turns one web request into a stream of
-individual daily records.
+URL, downloads the response, and parses it as JSON.
 
-The middle stage is an iterative transformer that receives those daily records
+The Second stage is an iterative transformer that receives those daily records
 one at a time and pulls out just the two pieces of information the chart needs.
-From each record it reads the date field, which arrives as a human-readable
-string in day / full-month-name / year form (for example "15 March 2020"), and
-parses it into a proper date object so it can be plotted on a time axis. It also
-reads the field holding that day's newly confirmed case count and converts it
-from text to an integer. It then passes both values — the parsed date and the
-integer case count for that day — onward on its single output, so that each item
-leaving this stage represents one point on the eventual graph. Because it works
-strictly one record in, one result out, it holds no state and simply relays a
-cleaned-up version of each record.
+From each record it reads the date field and
+parses it into a proper date object so it can be plotted on a time axis.
 
-The final stage is the collector and visualizer, and it is set up so that every
-record in the stream is funneled into a single instance of it rather than being
-spread across parallel workers. This matters: the plotting only makes sense if
-one place sees the whole series, so the stage's input is configured to gather
-all incoming data globally into one worker. As records arrive it does nothing
-but accumulate them, appending each date to a running list of dates and each
-case count to a running list of counts. It produces no streaming output of its
-own. Only once the entire stream has been consumed — in a wrap-up step that runs
-after the last record — does it do the real work: it creates a wide figure,
-plots the daily new-case counts against their dates as a connected line with a
-marker at each point, gives the chart a title and axis labels for date and new
-cases, rotates the date labels so they stay readable, tidies the layout, and
-writes the finished figure out to a PNG file on disk rather than displaying it
-on screen.
+The final third stage is the collector and visualizer, set up so that every record in the
+stream is funneled into a single instance of it rather than being
+spread across parallel workers. This PE is not iterative as it needs to collect all
+data to then visualize it with matplotlib.
 
 The three stages are wired together in order — source into transformer, then
 transformer into collector — forming the full pipeline that turns a single API

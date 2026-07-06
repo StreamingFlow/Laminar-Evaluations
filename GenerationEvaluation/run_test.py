@@ -17,6 +17,7 @@ import csv
 import json
 import os
 import random
+import re
 import statistics
 import tempfile
 import time
@@ -448,10 +449,32 @@ from textual import work
 from rich.text import Text
 
 
+# ANSI escape sequences Rich emits when it thinks stdout is a real terminal:
+# CSI (colors, cursor moves, line erases), OSC (hyperlinks / titles), and other
+# single-character Fe escapes. Stripping these turns Rich's highlighted source
+# dump back into plain, readable text inside the Log widget.
+_ANSI_RE = re.compile(
+    r"\x1B\[[0-?]*[ -/]*[@-~]"             # CSI … final byte
+    r"|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)"  # OSC … BEL or ST terminator
+    r"|\x1B[\x40-\x5F]"                    # other Fe escapes
+)
+# C0 control characters to drop (keep tab; newlines are handled by the splitter).
+_CTRL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+
+
+def _clean_line(line: str) -> str:
+    """Convert one line of terminal output into plain, readable text."""
+    line = _ANSI_RE.sub("", line)
+    if "\r" in line:                     # honour carriage-return overwrites
+        line = line.rsplit("\r", 1)[-1]  # (progress bars / spinners)
+    return _CTRL_RE.sub("", line)
+
+
 class UIStream:
     """
-    A file-like object standing in for stdout during evaluation. Buffers by line
-    and pushes complete lines to a Textual widget from the worker thread.
+    A file-like object standing in for stdout during evaluation. Buffers by line,
+    strips terminal control codes, and pushes clean lines to a Textual widget
+    from the worker thread.
     """
     def __init__(self, app: App, sink: Callable[[str], None]):
         self.app = app
@@ -464,12 +487,12 @@ class UIStream:
         self._buf += s
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            self.app.call_from_thread(self.sink, line)
+            self.app.call_from_thread(self.sink, _clean_line(line))
         return len(s)
 
     def flush(self):
         if self._buf:
-            self.app.call_from_thread(self.sink, self._buf)
+            self.app.call_from_thread(self.sink, _clean_line(self._buf))
             self._buf = ""
 
     def isatty(self):

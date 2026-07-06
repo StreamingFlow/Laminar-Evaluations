@@ -24,11 +24,6 @@ class PairProducer(GenericPE):
 
     def __init__(self):
         GenericPE.__init__(self)
-        self._add_input("odd")
-        self._add_input("even")
-        self._add_output("output")
-        self.list_odd = []
-        self.list_even = []
 
     def _process(self, inputs):
         raise NotImplementedError('   business logic is intentionally unimplemented')
