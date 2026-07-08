@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
-"""
-Structural evaluation of generated dispel4py workflows — Textual edition.
 
-Adds on top of the original script:
-  * repeated runs (--runs N) with mean ± standard deviation on every measure,
-    both per-task (across runs) and in the overall summary;
-  * a Textual TUI whose right-hand pane is a dedicated window that captures
-    everything the generation function prints to stdout;
-  * a --headless mode that does the same multi-run evaluation without a TUI.
-"""
 from __future__ import annotations
 
 import argparse
 import ast
 import csv
 import json
+import math
 import os
 import random
 import re
@@ -26,6 +18,9 @@ from contextlib import redirect_stdout
 from datetime import datetime
 from typing import Callable, Iterable
 
+import networkx as nx
+import numpy as np
+
 BASE_KIND = {
     "ProducerPE": "producer",
     "IterativePE": "iterative",
@@ -34,9 +29,24 @@ BASE_KIND = {
     "SimpleFunctionPE": "iterative",
 }
 
+NAN = float("nan")
+
+# Set from CLI in main(). When False, port-name strings are ignored in every
+# structural comparison (topology F1, role F1, GED, isomorphism).
+STRICT_PORTS = False
+
+try:
+
+    _HAVE_GRAPH_LIBS = True
+except Exception:
+    _HAVE_GRAPH_LIBS = False
+
+USE_GRAPH_SIM = _HAVE_GRAPH_LIBS
+GRAPH_SIM_KEYS = ["ged", "ged_similarity", "graph_iso", "spectral_similarity"]
+
 
 # --------------------------------------------------------------------------- #
-# Graph extraction + structural scoring  (unchanged from the original)        #
+# Graph extraction                                                            #
 # --------------------------------------------------------------------------- #
 def _parse(src: str):
     try:
@@ -45,57 +55,207 @@ def _parse(src: str):
         return None
 
 
+def _dotted(node):
+    """Stable key for a Name or Attribute chain (`x`, `self.x`, `mod.C`), else None."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted(node.value)
+        return f"{base}.{node.attr}" if base is not None else None
+    return None
+
+
+def _called_name(call):
+    """Name of the class/function being called (`C()` -> 'C', `m.C()` -> 'C'), else None."""
+    f = call.func
+    if isinstance(f, ast.Name):
+        return f.id
+    if isinstance(f, ast.Attribute):
+        return f.attr
+    return None
+
+
+def _resolve_call_role(call, class_roles, factory_roles):
+    """Role of the PE instance produced by a Call, or None if not a known PE."""
+    cn = _called_name(call)
+    if cn is None:
+        return None
+    if cn in class_roles:  # subclass of a PE base (possibly transitive)
+        return class_roles[cn]
+    if cn in BASE_KIND:  # direct use of a base class, e.g. SimpleFunctionPE(f)
+        return BASE_KIND[cn]
+    if cn in factory_roles:  # factory function that returns a PE
+        return factory_roles[cn]
+    return None
+
+
 def _class_roles(tree):
-    roles = {}
+    """
+    Map class name -> role, resolving subclasses transitively so that a subclass
+    of a subclass of a PE base (class B(A); class A(ProducerPE)) still resolves.
+    """
+    defs = {}
     for n in ast.walk(tree):
         if isinstance(n, ast.ClassDef):
+            bases = []
             for b in n.bases:
                 bn = b.id if isinstance(b, ast.Name) else getattr(b, "attr", None)
-                if bn in BASE_KIND:
-                    roles[n.name] = BASE_KIND[bn]
+                if bn:
+                    bases.append(bn)
+            defs[n.name] = bases
+    roles, changed = {}, True
+    while changed:
+        changed = False
+        for cls, bases in defs.items():
+            if cls in roles:
+                continue
+            for b in bases:
+                r = BASE_KIND.get(b) or roles.get(b)
+                if r:
+                    roles[cls] = r
+                    changed = True
+                    break
     return roles
 
 
-def _var_to_class(tree, class_roles):
+def _factory_roles(tree, class_roles):
+    """
+    Map function name -> role for simple factories: a def whose body returns a
+    PE instantiation (`def make_reader(): return ReadPE()`). First resolvable
+    return wins.
+    """
+    out = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for ret in ast.walk(fn):
+                if isinstance(ret, ast.Return) and isinstance(ret.value, ast.Call):
+                    r = _resolve_call_role(ret.value, class_roles, {})
+                    if r:
+                        out[fn.name] = r
+                        break
+    return out
+
+
+def _var_roles(tree, class_roles, factory_roles):
+    """
+    Map variable key -> role for assignments to a Name or Attribute target,
+    covering `x = C()`, `self.x = C()`, annotated `x: T = C()`, and chained
+    `a = b = C()`.
+    """
     out = {}
     for n in ast.walk(tree):
         if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
-            f = n.value.func
-            cname = f.id if isinstance(f, ast.Name) else None
-            if cname in class_roles and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
-                out[n.targets[0].id] = cname
+            targets, value = n.targets, n.value
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.value, ast.Call):
+            targets, value = [n.target], n.value
+        else:
+            continue
+        role = _resolve_call_role(value, class_roles, factory_roles)
+        if role is None:
+            continue
+        for t in targets:
+            key = _dotted(t)
+            if key:
+                out[key] = role
     return out
 
 
 def _connect_calls(tree):
+    """Yield (src_expr, src_port, dst_expr, dst_port) for every *.connect(...) call."""
     for n in ast.walk(tree):
         if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                 and n.func.attr == "connect" and len(n.args) >= 4):
             a = n.args
-            name = lambda x: x.id if isinstance(x, ast.Name) else None
             const = lambda x: x.value if isinstance(x, ast.Constant) else None
-            yield name(a[0]), const(a[1]), name(a[2]), const(a[3])
+            yield a[0], const(a[1]), a[2], const(a[3])
+
+
+def _endpoint(expr, var_roles, class_roles, factory_roles):
+    """
+    Resolve a connect endpoint expression to (node_key, role).
+      * variable / attribute reference -> ("var", "self.x")    role from assignment
+      * inline instantiation C()        -> ("inline", <unique>) role resolved directly
+      * anything else (subscripts, …)   -> (None, None)  (edge dropped)
+    Each inline call is a distinct node; the same variable used twice is one node.
+    """
+    if isinstance(expr, ast.Call):
+        return ("inline", id(expr)), _resolve_call_role(expr, class_roles, factory_roles)
+    key = _dotted(expr)
+    if key is not None:
+        return ("var", key), var_roles.get(key)
+    return None, None
+
+
+def _port_key(p) -> str:
+    """Normalise a port name for comparison — dropped entirely unless --strict-ports."""
+    if not STRICT_PORTS:
+        return ""
+    return "" if p is None else str(p)
+
+
+def _canonical_ids(node_roles: list, edges: list) -> dict:
+    """
+    Assign each local node id an *order-invariant* canonical index via
+    Weisfeiler-Lehman colour refinement. Two structurally identical workflows
+    get the same canonical indices no matter what order their connect() calls
+    were written in, so the topology-F1 edge sets line up correctly.
+    """
+    n = len(node_roles)
+    if n == 0:
+        return {}
+    sig = [str(node_roles[v]) for v in range(n)]
+    inc: list[list] = [[] for _ in range(n)]
+    out: list[list] = [[] for _ in range(n)]
+    for (s, sp, d, dp) in edges:
+        if 0 <= s < n and 0 <= d < n:
+            out[s].append((_port_key(sp), d))
+            inc[d].append((_port_key(dp), s))
+
+    for _ in range(n):  # n rounds is enough to stabilise on n nodes
+        raw = []
+        for v in range(n):
+            im = tuple(sorted((p, sig[u]) for (p, u) in inc[v]))
+            om = tuple(sorted((p, sig[w]) for (p, w) in out[v]))
+            raw.append(repr((sig[v], im, om)))
+        relabel = {s: i for i, s in enumerate(sorted(set(raw)))}
+        sig = [str(relabel[s]) for s in raw]
+
+    # Sort nodes by final colour; the local-id tiebreak is symmetric-safe for
+    # interchangeable (automorphic) nodes, so isomorphic graphs still align.
+    order = sorted(range(n), key=lambda v: (sig[v], v))
+    return {local: idx for idx, local in enumerate(order)}
 
 
 def extract_graph(src: str) -> dict:
     tree = _parse(src)
     if tree is None:
         return {"parse_ok": False, "role_edges": set(), "topo_edges": frozenset(),
-                "n_stages": 0, "roles": Counter()}
+                "edges": [], "n_stages": 0, "roles": Counter(), "node_roles": []}
     class_roles = _class_roles(tree)
-    var_class = _var_to_class(tree, class_roles)
-    role_edges, order, topo = set(), [], []
-    for s, sp, d, dp in _connect_calls(tree):
-        role_edges.add((class_roles.get(var_class.get(s)),
-                        class_roles.get(var_class.get(d)), sp, dp))
-        for v in (s, d):
-            if v and v not in order:
-                order.append(v)
-        if s in order and d in order:
-            topo.append((order.index(s), sp, order.index(d), dp))
-    return {"parse_ok": True, "roles": Counter(class_roles.values()),
-            "role_edges": role_edges, "topo_edges": frozenset(topo),
-            "n_stages": len(order)}
+    factory_roles = _factory_roles(tree, class_roles)
+    var_roles = _var_roles(tree, class_roles, factory_roles)
+
+    order, key_role, raw = [], {}, []
+    for e_s, sp, e_d, dp in _connect_calls(tree):
+        ks, rs = _endpoint(e_s, var_roles, class_roles, factory_roles)
+        kd, rd = _endpoint(e_d, var_roles, class_roles, factory_roles)
+        for k, r in ((ks, rs), (kd, rd)):
+            if k is not None and k not in order:
+                order.append(k)
+                key_role[k] = r
+        if ks is not None and kd is not None:
+            raw.append((order.index(ks), sp, order.index(kd), dp))
+    node_roles = [key_role.get(k) for k in order]
+
+    canon = _canonical_ids(node_roles, raw)
+    topo = frozenset((canon[s], _port_key(sp), canon[d], _port_key(dp))
+                     for (s, sp, d, dp) in raw)
+    role_edges = {(node_roles[s], node_roles[d], _port_key(sp), _port_key(dp))
+                  for (s, sp, d, dp) in raw}
+
+    return {"parse_ok": True, "roles": Counter(r for r in node_roles if r),
+            "role_edges": role_edges, "topo_edges": topo,
+            "edges": raw, "n_stages": len(order), "node_roles": node_roles}
 
 
 def _f1(gen: Iterable, truth: Iterable) -> float:
@@ -106,30 +266,113 @@ def _f1(gen: Iterable, truth: Iterable) -> float:
     return 0.0 if p + r == 0 else round(2 * p * r / (p + r), 4)
 
 
+# --------------------------------------------------------------------------- #
+# Whole-graph similarity metrics (networkx + numpy)                           #
+# --------------------------------------------------------------------------- #
+def _to_digraph(graph: dict):
+    """Labelled DiGraph: node label = role, edge label = (src, dst) ports (mode-aware)."""
+    G = nx.DiGraph()
+    for i, role in enumerate(graph.get("node_roles", [])):
+        G.add_node(i, role=role if role is not None else "?")
+    for (s, sp, d, dp) in graph.get("edges", []):
+        G.add_edge(s, d, ports=(_port_key(sp), _port_key(dp)))
+    return G
+
+
+def _node_match(a, b):
+    return a.get("role") == b.get("role")
+
+
+def _edge_match(a, b):
+    return a.get("ports") == b.get("ports")
+
+
+def _graph_edit_distance(G1, G2) -> float:
+    try:
+        d = nx.graph_edit_distance(G1, G2, node_match=_node_match,
+                                   edge_match=_edge_match, timeout=10)
+    except Exception:
+        d = None
+    if d is None:
+        try:
+            d = next(nx.optimize_graph_edit_distance(
+                G1, G2, node_match=_node_match, edge_match=_edge_match))
+        except Exception:
+            d = float(G1.number_of_nodes() + G1.number_of_edges()
+                      + G2.number_of_nodes() + G2.number_of_edges())
+    return float(d)
+
+
+def _spectral_similarity(G1, G2) -> float:
+    s1, s2 = nx.laplacian_spectrum(G1), nx.laplacian_spectrum(G2)
+    L = max(len(s1), len(s2))
+    if L == 0:
+        return 1.0
+    s1 = np.pad(s1, (0, L - len(s1)))
+    s2 = np.pad(s2, (0, L - len(s2)))
+    dist = float(np.linalg.norm(s1 - s2))
+    denom = float(np.linalg.norm(s1) + np.linalg.norm(s2))
+    return 1.0 if denom == 0 else max(0.0, 1.0 - dist / denom)
+
+
+def graph_similarity_scores(answer_graph: dict, truth_graph: dict) -> dict:
+    if not USE_GRAPH_SIM:
+        return {"ged": NAN, "ged_similarity": NAN,
+                "graph_iso": NAN, "spectral_similarity": NAN}
+    G1 = _to_digraph(answer_graph)
+    G2 = _to_digraph(truth_graph)
+    ged = _graph_edit_distance(G1, G2)
+    bound = (G1.number_of_nodes() + G1.number_of_edges()
+             + G2.number_of_nodes() + G2.number_of_edges())
+    ged_sim = 1.0 if bound == 0 else max(0.0, 1.0 - ged / bound)
+    try:
+        iso = 1.0 if nx.is_isomorphic(G1, G2, node_match=_node_match,
+                                      edge_match=_edge_match) else 0.0
+    except Exception:
+        iso = 0.0
+    spec = _spectral_similarity(G1, G2)
+    return {"ged": round(ged, 4), "ged_similarity": round(ged_sim, 4),
+            "graph_iso": iso, "spectral_similarity": round(spec, 4)}
+
+
 def structural_scores(answer: str, ground_truth: str) -> dict:
     g = extract_graph(answer)
     t = extract_graph(ground_truth)
     if not g["parse_ok"]:
-        return {"parse_ok": 0.0, "topology_f1": 0.0, "role_edge_f1": 0.0, "stage_count_ok": 0.0}
-    return {"parse_ok": 1.0,
-            "topology_f1": _f1(g["topo_edges"], t["topo_edges"]),
-            "role_edge_f1": _f1(g["role_edges"], t["role_edges"]),
-            "stage_count_ok": float(g["n_stages"] == t["n_stages"])}
+        return {"parse_ok": 0.0, "topology_f1": 0.0, "role_edge_f1": 0.0,
+                "stage_count_ok": 0.0, "ged": NAN, "ged_similarity": 0.0,
+                "graph_iso": 0.0, "spectral_similarity": 0.0}
+    scores = {"parse_ok": 1.0,
+              "topology_f1": _f1(g["topo_edges"], t["topo_edges"]),
+              "role_edge_f1": _f1(g["role_edges"], t["role_edges"]),
+              "stage_count_ok": float(g["n_stages"] == t["n_stages"])}
+    scores.update(graph_similarity_scores(g, t))
+    return scores
 
 
 def structural_scores_multi(answer: str, ground_truths: list[str]) -> dict:
-    best = {"parse_ok": 0.0, "topology_f1": 0.0, "role_edge_f1": 0.0, "stage_count_ok": 0.0}
+    best = None
     for gt in ground_truths:
         s = structural_scores(answer, gt)
-        if (s["topology_f1"], s["role_edge_f1"]) > (best["topology_f1"], best["role_edge_f1"]):
+        if best is None or ((s["topology_f1"], s["role_edge_f1"])
+                            > (best["topology_f1"], best["role_edge_f1"])):
             best = s
+    if best is None:
+        best = structural_scores(answer, "")
     return best
 
 
 # --------------------------------------------------------------------------- #
-# Single-run evaluation driver  (unchanged from the original)                 #
+# Single-run evaluation driver                                                #
 # --------------------------------------------------------------------------- #
 STATUS_OK, STATUS_SYNTAX, STATUS_EMPTY, STATUS_GEN = "OK", "SYNTAX_ERR", "EMPTY", "GEN_ERROR"
+
+
+def _blank_row(task: str) -> dict:
+    return {"task": task, "status": None, "error": "", "seconds": 0.0,
+            "parse_ok": 0.0, "topology_f1": 0.0, "role_edge_f1": 0.0,
+            "stage_count_ok": 0.0, "ged": NAN, "ged_similarity": 0.0,
+            "graph_iso": 0.0, "spectral_similarity": 0.0}
 
 
 def run_evaluation(generate_fn: Callable[[str], str], truth_dir: str, descr_dir: str,
@@ -138,8 +381,7 @@ def run_evaluation(generate_fn: Callable[[str], str], truth_dir: str, descr_dir:
     truth_files = sorted(f for f in os.listdir(truth_dir) if f.endswith(".py"))
     for py in truth_files:
         task = py[:-3]
-        row = {"task": task, "status": None, "error": "", "seconds": 0.0,
-               "parse_ok": 0.0, "topology_f1": 0.0, "role_edge_f1": 0.0, "stage_count_ok": 0.0}
+        row = _blank_row(task)
         try:
             with open(os.path.join(truth_dir, py)) as f:
                 truth_code = f.read()
@@ -162,7 +404,7 @@ def run_evaluation(generate_fn: Callable[[str], str], truth_dir: str, descr_dir:
                 scores = structural_scores_multi(str(code), [truth_code])
                 row.update(scores)
                 row["status"] = STATUS_OK if scores["parse_ok"] else STATUS_SYNTAX
-        except Exception as e:  # generation blew up
+        except Exception as e:
             row["seconds"] = time.perf_counter() - t0
             row["status"], row["error"] = STATUS_GEN, f"{type(e).__name__}: {e}"
         results.append(row)
@@ -177,7 +419,8 @@ def aggregate(results: list[dict]) -> dict:
     parsed = [r for r in results if r["parse_ok"] == 1.0]
 
     def mean(key, rows):
-        vals = [r[key] for r in rows]
+        vals = [r[key] for r in rows
+                if not (isinstance(r[key], float) and math.isnan(r[key]))]
         return statistics.fmean(vals) if vals else 0.0
 
     return {
@@ -189,29 +432,41 @@ def aggregate(results: list[dict]) -> dict:
         "median_topology_f1": statistics.median([r["topology_f1"] for r in parsed]) if parsed else 0.0,
         "mean_role_edge_f1": mean("role_edge_f1", parsed),
         "stage_count_pass_rate": mean("stage_count_ok", parsed),
+        "mean_ged": mean("ged", parsed),
+        "mean_ged_similarity": mean("ged_similarity", parsed),
+        "graph_iso_rate": mean("graph_iso", parsed),
+        "mean_spectral_similarity": mean("spectral_similarity", parsed),
         "total_seconds": sum(r["seconds"] for r in results),
         "n_parsed": len(parsed),
     }
 
 
 # --------------------------------------------------------------------------- #
-# Multi-run helpers: mean ± standard deviation across repeated runs            #
+# Multi-run helpers                                                            #
 # --------------------------------------------------------------------------- #
+def _clean(vals):
+    return [v for v in vals
+            if v is not None and not (isinstance(v, float) and math.isnan(v))]
+
+
 def mean_or0(vals) -> float:
-    vals = list(vals)
+    vals = _clean(vals)
     return statistics.fmean(vals) if vals else 0.0
 
 
 def std_or0(vals) -> float:
-    """Sample standard deviation; 0.0 when fewer than two data points."""
-    vals = list(vals)
+    vals = _clean(vals)
     return statistics.stdev(vals) if len(vals) >= 2 else 0.0
+
+
+def _fmt_ged(v) -> str:
+    """Format a raw GED distance for one-line logs; 'n/a' when unavailable (NaN)."""
+    return "n/a" if (isinstance(v, float) and math.isnan(v)) else f"{v:.2f}"
 
 
 def run_repeated(generate_fn, truth_dir, descr_dir, runs: int,
                  task_cb: Callable[[int, dict], None] | None = None,
                  run_done_cb: Callable[[int, list[dict]], None] | None = None) -> list[list[dict]]:
-    """Run the whole evaluation `runs` times. Returns a list of per-run result lists."""
     all_results: list[list[dict]] = []
     for ri in range(runs):
         cb = (lambda row, ri=ri: task_cb(ri, row)) if task_cb else None
@@ -223,7 +478,6 @@ def run_repeated(generate_fn, truth_dir, descr_dir, runs: int,
 
 
 def per_task_stats(all_results: list[list[dict]]) -> list[dict]:
-    """Aggregate each task across runs into mean ± std of every measure."""
     by_task: "OrderedDict[str, list[dict]]" = OrderedDict()
     for run in all_results:
         for row in run:
@@ -235,27 +489,34 @@ def per_task_stats(all_results: list[list[dict]]) -> list[dict]:
         topo = [r["topology_f1"] for r in parsed]
         role = [r["role_edge_f1"] for r in parsed]
         stage = [r["stage_count_ok"] for r in parsed]
+        gsim = [r["ged_similarity"] for r in parsed]
+        ged = [r["ged"] for r in parsed]
+        spec = [r["spectral_similarity"] for r in parsed]
+        iso = [r["graph_iso"] for r in parsed]
         secs = [r["seconds"] for r in rows]
         out.append({
-            "task": task,
-            "n": len(rows),
+            "task": task, "n": len(rows),
             "ok": sum(1 for r in rows if r["status"] == STATUS_OK),
             "parse_rate": mean_or0([r["parse_ok"] for r in rows]),
             "topo_mean": mean_or0(topo), "topo_std": std_or0(topo),
             "role_mean": mean_or0(role), "role_std": std_or0(role),
             "stage_rate": mean_or0(stage),
+            "ged_mean": mean_or0(ged), "ged_std": std_or0(ged),
+            "gsim_mean": mean_or0(gsim), "gsim_std": std_or0(gsim),
+            "spec_mean": mean_or0(spec), "spec_std": std_or0(spec),
+            "iso_rate": mean_or0(iso),
             "time_mean": mean_or0(secs), "time_std": std_or0(secs),
         })
     return out
 
 
-# Overall summary metrics we track run-to-run.
 _SUMMARY_KEYS = ["syntactic_validity_rate", "mean_topology_f1", "median_topology_f1",
-                 "mean_role_edge_f1", "stage_count_pass_rate", "total_seconds", "n_parsed"]
+                 "mean_role_edge_f1", "stage_count_pass_rate",
+                 "mean_ged", "mean_ged_similarity", "graph_iso_rate",
+                 "mean_spectral_similarity", "total_seconds", "n_parsed"]
 
 
 def summarize_runs(all_results: list[list[dict]]) -> dict:
-    """Compute per-run aggregates, then mean ± std of each metric across runs."""
     per_run = [aggregate(r) for r in all_results]
     metrics = {}
     for k in _SUMMARY_KEYS:
@@ -266,7 +527,7 @@ def summarize_runs(all_results: list[list[dict]]) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Report saving (multi-run)                                                    #
+# Report saving                                                                #
 # --------------------------------------------------------------------------- #
 def save_multi_reports(all_results: list[list[dict]], out_dir: str) -> tuple[str, str]:
     os.makedirs(out_dir, exist_ok=True)
@@ -279,11 +540,14 @@ def save_multi_reports(all_results: list[list[dict]], out_dir: str) -> tuple[str
 
     with open(json_path, "w") as f:
         json.dump({"generated_at": stamp, "n_runs": len(all_results),
+                   "strict_ports": STRICT_PORTS, "graph_sim_enabled": USE_GRAPH_SIM,
                    "summary": summary, "per_task": task_stats,
-                   "runs": all_results}, f, indent=2)
+                   "runs": all_results}, f, indent=2, default=str)
 
     fields = ["task", "n", "ok", "parse_rate", "topo_mean", "topo_std",
-              "role_mean", "role_std", "stage_rate", "time_mean", "time_std"]
+              "role_mean", "role_std", "stage_rate",
+              "ged_mean", "ged_std", "gsim_mean", "gsim_std",
+              "spec_mean", "spec_std", "iso_rate", "time_mean", "time_std"]
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -296,7 +560,6 @@ def save_multi_reports(all_results: list[list[dict]], out_dir: str) -> tuple[str
 # Generation backends                                                         #
 # --------------------------------------------------------------------------- #
 def generate_workflow_wrap():
-    """Build a generate_fn backed by the real Laminar client (requires login)."""
     from laminar.client.d4pyclient import d4pClient
     from laminar.clitools.advanced_search import AdvancedSearchCommand
     from pwinput import pwinput
@@ -314,7 +577,6 @@ def generate_workflow_wrap():
 
 
 def _linear_workflow_code(roles: list[str]) -> str:
-    """Emit a simple linear dispel4py workflow from a list of base-class roles."""
     lines, names = [], []
     for i, r in enumerate(roles):
         cls = f"Stage{i}"
@@ -329,11 +591,6 @@ def _linear_workflow_code(roles: list[str]) -> str:
 
 
 def make_demo_generate_fn(seed: int | None = None):
-    """
-    Offline generator for --demo. Prints chatty progress to stdout (to exercise
-    the stdout window) and returns a slightly randomised workflow so that scores
-    vary run-to-run (to exercise the mean ± std reporting).
-    """
     rng = random.Random(seed)
 
     def _gen(description: str) -> str:
@@ -344,10 +601,13 @@ def make_demo_generate_fn(seed: int | None = None):
 
         n = rng.choice([2, 3, 3, 3, 4])
         roles = ["ProducerPE"] + ["IterativePE"] * (n - 2) + ["ConsumerPE"]
-        if rng.random() < 0.20:                 # occasional wrong role
+        if rng.random() < 0.20:
             roles[rng.randrange(n)] = "GenericPE"
 
-        drop_edge = rng.random() < 0.20         # occasional missing edge
+        # Randomise port names + connect-call order so the demo exercises the
+        # order-invariant / port-insensitive matching.
+        oport, iport = rng.choice([("output", "input"), ("out", "in"), ("result", "data")])
+        drop_edge = rng.random() < 0.20
         lines, names = [], []
         for i, r in enumerate(roles):
             cls = f"Stage{i}"
@@ -356,10 +616,11 @@ def make_demo_generate_fn(seed: int | None = None):
             lines[-1] += f"{names[-1]} = {cls}()"
         lines.insert(len(roles), "graph = WorkflowGraph()")
         skip = rng.randrange(max(1, len(names) - 1)) if drop_edge else -1
-        for i in range(len(names) - 1):
-            if i == skip:
-                continue
-            lines.append(f"graph.connect({names[i]}, 'output', {names[i + 1]}, 'input')")
+        conns = [f"graph.connect({names[i]}, '{oport}', {names[i + 1]}, '{iport}')"
+                 for i in range(len(names) - 1) if i != skip]
+        if rng.random() < 0.5:
+            conns.reverse()
+        lines += conns
         print("[gen] complete")
         return "\n".join(lines) + "\n"
 
@@ -367,15 +628,14 @@ def make_demo_generate_fn(seed: int | None = None):
 
 
 def make_demo_fixtures(truth_dir: str, descr_dir: str) -> None:
-    """Write a small self-contained set of truth/description files for --demo."""
     os.makedirs(truth_dir, exist_ok=True)
     os.makedirs(descr_dir, exist_ok=True)
     specs = {
         "wordcount": ["ProducerPE", "IterativePE", "ConsumerPE"],
-        "etl_pipe":  ["ProducerPE", "IterativePE", "IterativePE", "ConsumerPE"],
+        "etl_pipe": ["ProducerPE", "IterativePE", "IterativePE", "ConsumerPE"],
         "sensor_avg": ["ProducerPE", "IterativePE", "ConsumerPE"],
         "two_stage": ["ProducerPE", "ConsumerPE"],
-        "wide_map":  ["ProducerPE", "IterativePE", "IterativePE", "IterativePE", "ConsumerPE"],
+        "wide_map": ["ProducerPE", "IterativePE", "IterativePE", "IterativePE", "ConsumerPE"],
     }
     for name, roles in specs.items():
         with open(os.path.join(truth_dir, name + ".py"), "w") as f:
@@ -386,49 +646,58 @@ def make_demo_fixtures(truth_dir: str, descr_dir: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Headless multi-run runner                                                   #
+# Headless runner                                                              #
 # --------------------------------------------------------------------------- #
 def print_multi_summary(all_results: list[list[dict]]) -> None:
     stats = per_task_stats(all_results)
     summ = summarize_runs(all_results)
-    cols = [("Task", 26), ("n", 4), ("OK", 4), ("parse%", 7),
-            ("topo_f1 μ±σ", 16), ("role_f1 μ±σ", 16), ("stage%", 7), ("time μ", 8)]
+    cols = [("Task", 22), ("n", 4), ("OK", 4), ("parse%", 7),
+            ("topo_f1 μ±σ", 15), ("role_f1 μ±σ", 15),
+            ("ged μ±σ", 15), ("spec μ±σ", 15), ("iso%", 6),
+            ("stage%", 7), ("time μ", 8)]
     header = "  ".join(name.ljust(w) for name, w in cols)
     print("\n" + header)
     print("-" * len(header))
     for s in stats:
         print("  ".join([
-            s["task"][:26].ljust(26),
-            str(s["n"]).ljust(4),
-            str(s["ok"]).ljust(4),
-            f"{s['parse_rate']*100:.0f}%".ljust(7),
-            f"{s['topo_mean']:.3f}±{s['topo_std']:.3f}".ljust(16),
-            f"{s['role_mean']:.3f}±{s['role_std']:.3f}".ljust(16),
-            f"{s['stage_rate']*100:.0f}%".ljust(7),
+            s["task"][:22].ljust(22), str(s["n"]).ljust(4), str(s["ok"]).ljust(4),
+            f"{s['parse_rate'] * 100:.0f}%".ljust(7),
+            f"{s['topo_mean']:.3f}±{s['topo_std']:.3f}".ljust(15),
+            f"{s['role_mean']:.3f}±{s['role_std']:.3f}".ljust(15),
+            f"{s['ged_mean']:.2f}±{s['ged_std']:.2f}".ljust(15),
+            f"{s['spec_mean']:.3f}±{s['spec_std']:.3f}".ljust(15),
+            f"{s['iso_rate'] * 100:.0f}%".ljust(6),
+            f"{s['stage_rate'] * 100:.0f}%".ljust(7),
             f"{s['time_mean']:.1f}s".ljust(8),
         ]))
     m = summ["metrics"]
 
     def pm(key, pct=False, prec=3):
         d = m[key]
-        return (f"{d['mean']*100:.0f}%±{d['std']*100:.0f}%" if pct
+        return (f"{d['mean'] * 100:.0f}%±{d['std'] * 100:.0f}%" if pct
                 else f"{d['mean']:.{prec}f}±{d['std']:.{prec}f}")
 
     print("\n" + "=" * len(header))
-    print(f"Runs: {summ['n_runs']}   "
+    print(f"Runs: {summ['n_runs']}   ports: {'strict' if STRICT_PORTS else 'ignored'}   "
           f"validity {pm('syntactic_validity_rate', pct=True)}   "
           f"stage-pass {pm('stage_count_pass_rate', pct=True)}")
     print(f"topology_f1 {pm('mean_topology_f1')}   role_edge_f1 {pm('mean_role_edge_f1')}   "
           f"time/run {pm('total_seconds', prec=1)}s")
+    if USE_GRAPH_SIM:
+        print(f"ged {pm('mean_ged', prec=2)}   ged_sim {pm('mean_ged_similarity')}   "
+              f"iso {pm('graph_iso_rate', pct=True)}   spectral {pm('mean_spectral_similarity')}")
+    else:
+        print("graph-similarity metrics disabled (install networkx + numpy)")
 
 
 def run_headless(generate_fn, truth_dir, descr_dir, runs, out_dir, save):
     def task_cb(ri, row):
-        print(f"  run {ri+1}/{runs} [{row['status']:<10}] {row['task']:<26} "
-              f"topo={row['topology_f1']:.3f} ({row['seconds']:.1f}s)")
+        print(f"  run {ri + 1}/{runs} [{row['status']:<10}] {row['task']:<22} "
+              f"topo={row['topology_f1']:.3f} ged={_fmt_ged(row['ged'])} "
+              f"({row['seconds']:.1f}s)")
 
     def run_done_cb(ri, res):
-        print(f"# finished run {ri+1}/{runs}")
+        print(f"# finished run {ri + 1}/{runs}")
 
     all_results = run_repeated(generate_fn, truth_dir, descr_dir, runs,
                                task_cb=task_cb, run_done_cb=run_done_cb)
@@ -448,34 +717,22 @@ from textual.widgets import (Header, Footer, DataTable, Log, RichLog, Static,
 from textual import work
 from rich.text import Text
 
-
-# ANSI escape sequences Rich emits when it thinks stdout is a real terminal:
-# CSI (colors, cursor moves, line erases), OSC (hyperlinks / titles), and other
-# single-character Fe escapes. Stripping these turns Rich's highlighted source
-# dump back into plain, readable text inside the Log widget.
 _ANSI_RE = re.compile(
-    r"\x1B\[[0-?]*[ -/]*[@-~]"             # CSI … final byte
-    r"|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)"  # OSC … BEL or ST terminator
-    r"|\x1B[\x40-\x5F]"                    # other Fe escapes
+    r"\x1B\[[0-?]*[ -/]*[@-~]"
+    r"|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)"
+    r"|\x1B[\x40-\x5F]"
 )
-# C0 control characters to drop (keep tab; newlines are handled by the splitter).
 _CTRL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 
 
 def _clean_line(line: str) -> str:
-    """Convert one line of terminal output into plain, readable text."""
     line = _ANSI_RE.sub("", line)
-    if "\r" in line:                     # honour carriage-return overwrites
-        line = line.rsplit("\r", 1)[-1]  # (progress bars / spinners)
+    if "\r" in line:
+        line = line.rsplit("\r", 1)[-1]
     return _CTRL_RE.sub("", line)
 
 
 class UIStream:
-    """
-    A file-like object standing in for stdout during evaluation. Buffers by line,
-    strips terminal control codes, and pushes clean lines to a Textual widget
-    from the worker thread.
-    """
     def __init__(self, app: App, sink: Callable[[str], None]):
         self.app = app
         self.sink = sink
@@ -502,6 +759,18 @@ class UIStream:
 def _pm_text(mean: float, std: float) -> Text:
     color = "green" if mean >= 0.8 else "yellow" if mean >= 0.5 else "red"
     return Text(f"{mean:.3f}±{std:.3f}", style=color)
+
+
+def _dist_text(mean: float, std: float) -> Text:
+    """Raw GED distance (lower = closer). Not a 0..1 score, so no similarity colouring."""
+    if isinstance(mean, float) and math.isnan(mean):
+        return Text("n/a", style="dim")
+    return Text(f"{mean:.2f}±{std:.2f}", style="cyan")
+
+
+def _rate_text(rate: float) -> Text:
+    color = "green" if rate >= 0.8 else "yellow" if rate >= 0.5 else "red"
+    return Text(f"{rate * 100:.0f}%", style=color)
 
 
 class EvalApp(App):
@@ -558,11 +827,14 @@ class EvalApp(App):
 
     def on_mount(self) -> None:
         t = self.query_one("#results", DataTable)
-        t.add_columns("Task", "n", "OK", "parse%",
-                      "topo_f1 μ±σ", "role_f1 μ±σ", "stage%", "time μ")
+        t.add_columns("Task", "n", "OK", "parse%", "topo_f1 μ±σ", "role_f1 μ±σ",
+                      "ged μ±σ", "spec μ±σ", "iso%", "stage%", "time μ")
         self.query_one("#progress", ProgressBar).update(total=100, progress=0)
+        note = "ports: strict" if STRICT_PORTS else "ports: ignored"
+        if not USE_GRAPH_SIM:
+            note += "  ·  graph-sim disabled (networkx/numpy missing)"
+        self.query_one("#events", RichLog).write(f"[dim]{note}[/]")
 
-    # ---- controls -------------------------------------------------------- #
     def action_run(self) -> None:
         self._start_run()
 
@@ -597,7 +869,6 @@ class EvalApp(App):
         self.query_one("#results", DataTable).clear()
         self._evaluate(self.runs)
 
-    # ---- background worker ---------------------------------------------- #
     @work(thread=True, exclusive=True)
     def _evaluate(self, runs: int) -> None:
         log = self.query_one("#stdout", Log)
@@ -617,14 +888,19 @@ class EvalApp(App):
 
         done = 0
         all_results: list[list[dict]] = []
+        current_rows: list[dict] = []  # rows of the run currently in progress
 
         def task_cb(ri, row):
             nonlocal done
             done += 1
+            current_rows.append(row)
             self.call_from_thread(self._on_task, ri, runs, row, done, total)
+            # live-update the per-task table: finished runs + the in-progress one
+            self.call_from_thread(self._refresh, all_results + [list(current_rows)])
 
         def run_done_cb(ri, res):
             all_results.append(res)
+            current_rows.clear()
             self.call_from_thread(self._refresh, list(all_results))
 
         try:
@@ -639,14 +915,14 @@ class EvalApp(App):
         self.last_results = all_results
         self.call_from_thread(self._finish, all_results)
 
-    # ---- UI-thread updates ---------------------------------------------- #
     def _on_task(self, ri, runs, row, done, total) -> None:
         self.query_one("#progress", ProgressBar).update(total=total, progress=done)
         mark = {"OK": "[green]✓[/]", "SYNTAX_ERR": "[yellow]![/]",
                 "EMPTY": "[yellow]·[/]", "GEN_ERROR": "[red]✗[/]"}.get(row["status"], "?")
         self.query_one("#events", RichLog).write(
-            f"{mark} run {ri+1}/{runs} [b]{row['task']}[/] {row['status']} "
-            f"topo={row['topology_f1']:.3f} ({row['seconds']:.1f}s)")
+            f"{mark} run {ri + 1}/{runs} [b]{row['task']}[/] {row['status']} "
+            f"topo={row['topology_f1']:.3f} ged={_fmt_ged(row['ged'])} "
+            f"({row['seconds']:.1f}s)")
 
     def _refresh(self, all_results) -> None:
         t = self.query_one("#results", DataTable)
@@ -654,10 +930,13 @@ class EvalApp(App):
         for s in per_task_stats(all_results):
             t.add_row(
                 s["task"], str(s["n"]), str(s["ok"]),
-                f"{s['parse_rate']*100:.0f}%",
+                f"{s['parse_rate'] * 100:.0f}%",
                 _pm_text(s["topo_mean"], s["topo_std"]),
                 _pm_text(s["role_mean"], s["role_std"]),
-                f"{s['stage_rate']*100:.0f}%",
+                _dist_text(s["ged_mean"], s["ged_std"]),
+                _pm_text(s["spec_mean"], s["spec_std"]),
+                _rate_text(s["iso_rate"]),
+                f"{s['stage_rate'] * 100:.0f}%",
                 f"{s['time_mean']:.1f}s",
             )
         self._refresh_summary(all_results)
@@ -668,21 +947,27 @@ class EvalApp(App):
 
         def part(label, key, pct=False, prec=3):
             d = m[key]
-            body = (f"{d['mean']*100:.0f}%±{d['std']*100:.0f}%" if pct
+            body = (f"{d['mean'] * 100:.0f}%±{d['std'] * 100:.0f}%" if pct
                     else f"{d['mean']:.{prec}f}±{d['std']:.{prec}f}")
             return f"{label} [b]{body}[/]"
 
-        text = ("  ·  ".join([
+        line1 = "  ·  ".join([
             f"[b]{summ['n_runs']} run(s)[/]",
             part("validity", "syntactic_validity_rate", pct=True),
             part("topo_f1", "mean_topology_f1"),
             part("role_f1", "mean_role_edge_f1"),
             part("stage-pass", "stage_count_pass_rate", pct=True),
-        ]) + "\n" + "  ·  ".join([
-            part("median topo", "median_topology_f1"),
-            part("time/run", "total_seconds", prec=1) + "s",
-        ]))
-        self.query_one("#summary", Static).update(text)
+        ])
+        if USE_GRAPH_SIM:
+            line2 = "  ·  ".join([
+                part("ged", "mean_ged", prec=2),
+                part("ged_sim", "mean_ged_similarity"),
+                part("iso", "graph_iso_rate", pct=True),
+                part("spectral", "mean_spectral_similarity"),
+            ])
+        else:
+            line2 = "[dim]graph-similarity disabled[/]"
+        self.query_one("#summary", Static).update(line1 + "\n" + line2)
 
     def _finish(self, all_results) -> None:
         self._busy = False
@@ -710,11 +995,23 @@ def main():
     ap.add_argument("--demo", action="store_true", help="offline generator, no login")
     ap.add_argument("--no-save", action="store_true", help="do not write report files")
     ap.add_argument("--headless", action="store_true", help="run without the TUI")
+    ap.add_argument("--strict-ports", action="store_true",
+                    help="require exact port-name matches (default: port names ignored)")
+    ap.add_argument("--no-graph-sim", action="store_true",
+                    help="skip whole-graph similarity metrics (GED / isomorphism / spectral)")
     args = ap.parse_args()
+
+    global STRICT_PORTS, USE_GRAPH_SIM
+    STRICT_PORTS = args.strict_ports
+    if args.no_graph_sim:
+        USE_GRAPH_SIM = False
+    elif not _HAVE_GRAPH_LIBS:
+        USE_GRAPH_SIM = False
+        print("[warn] networkx/numpy not found — graph-similarity metrics disabled. "
+              "Install:  pip install networkx numpy")
 
     truth_dir, descr_dir = args.truth_dir, args.descr_dir
 
-    # In demo mode, synthesise fixtures if none are present so the UI is testable.
     if args.demo and (not os.path.isdir(truth_dir)
                       or not any(f.endswith(".py") for f in os.listdir(truth_dir))):
         tmp = tempfile.mkdtemp(prefix="d4py_demo_")
@@ -722,7 +1019,6 @@ def main():
         descr_dir = os.path.join(tmp, "descr")
         make_demo_fixtures(truth_dir, descr_dir)
 
-    # For the real backend, login happens here (before the TUI grabs the terminal).
     generate_fn = _build_generate_fn(args)
 
     if args.headless:

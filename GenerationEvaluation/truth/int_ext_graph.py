@@ -1,5 +1,5 @@
 from dispel4py.core import GenericPE
-from dispel4py.base import IterativePE
+from dispel4py.base import IterativePE, ConsumerPE
 from dispel4py.workflow_graph import WorkflowGraph
 
 class ReadRaDec(GenericPE):
@@ -37,11 +37,21 @@ class InternalExtinction(IterativePE):
         raise NotImplementedError('   business logic is intentionally unimplemented')
 
 
+class StoreResult(ConsumerPE):
+    def __init__(self):
+        ConsumerPE.__init__(self)
+
+    def _process(self, data):
+        raise NotImplementedError('   business logic is intentionally unimplemented')
+
 graph = WorkflowGraph()
 readData = ReadRaDec()
 votab = GetVOTable()
 filt = FilterColumns()
 intext = InternalExtinction()
+storeResult = StoreResult()
+
 graph.connect(readData, 'output', votab, 'input')
 graph.connect(votab, 'output', filt, 'input')
 graph.connect(filt, 'output', intext, 'input')
+graph.connect(intext, 'output', storeResult, 'input')

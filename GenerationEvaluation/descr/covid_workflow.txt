@@ -3,7 +3,8 @@ public web API, reshapes it record by record, and finishes by drawing a time
 series chart of daily new cases which it saves as an image. I want a simple,
 linear three-stage pipeline: a data source feeds a per-record transformer, and
 the transformer feeds a collector that does the plotting. Data flows one daily
-record at a time from the first stage to the last.
+record at a time from the first stage to the last. No specific final consumer sink
+PE is present in this workflow as we use the final visualizer PE to show data.
 
 The first stage is the data source, a GenericPE. It is given the URL in its __init__ of a JSON endpoint that
 serves national COVID-19 statistics for India, and when it runs it opens that

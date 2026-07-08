@@ -5,7 +5,8 @@ branches (one carrying only even numbers, the other only odd) and then brings
 the two branches back together in a final stage that couples them into
 (odd, even) pairs. It is a fan-out-then-merge shape rather than a straight line:
 one source, two parallel filters fed from that same source, and one collector
-that has a separate input for each branch.
+that has a separate input for each branch. No specific consumer sink PE is present as the
+third step pairing numbers prints them.
 
 The first stage is a pure producer with no input of its own. Every time it runs it
 produces a single random integer somewhere between 1 and 1000 and emits it.
