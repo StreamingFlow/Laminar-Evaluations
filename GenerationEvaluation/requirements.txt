@@ -1,1 +1,2 @@
 networkx
+codebleu @ git+https://github.com/k4black/codebleu.git@b0edb622f6a52fe9d1edc407be5061d3e1462a7f

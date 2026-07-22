@@ -20,6 +20,7 @@ from typing import Callable, Iterable
 
 import networkx as nx
 import numpy as np
+from codebleu import calc_codebleu
 
 BASE_KIND = {
     "ProducerPE": "producer",
@@ -43,6 +44,9 @@ except Exception:
 
 USE_GRAPH_SIM = _HAVE_GRAPH_LIBS
 GRAPH_SIM_KEYS = ["ged", "ged_similarity", "graph_iso", "spectral_similarity"]
+CODEBLEU_WEIGHTS = (0.25, 0.25, 0.25, 0.25)
+CODEBLEU_COMPONENTS = ("ngram_match_score", "weighted_ngram_match_score",
+                       "syntax_match_score", "dataflow_match_score")
 
 
 # --------------------------------------------------------------------------- #
@@ -235,7 +239,11 @@ def extract_graph(src: str) -> dict:
     factory_roles = _factory_roles(tree, class_roles)
     var_roles = _var_roles(tree, class_roles, factory_roles)
 
-    order, key_role, raw = [], {}, []
+    # Include every instantiated PE, not only instances that appear in a
+    # connection. This makes extra or disconnected stages affect the metrics.
+    order = [("var", key) for key in var_roles]
+    key_role = {("var", key): role for key, role in var_roles.items()}
+    raw = []
     for e_s, sp, e_d, dp in _connect_calls(tree):
         ks, rs = _endpoint(e_s, var_roles, class_roles, factory_roles)
         kd, rd = _endpoint(e_d, var_roles, class_roles, factory_roles)
@@ -335,6 +343,58 @@ def graph_similarity_scores(answer_graph: dict, truth_graph: dict) -> dict:
             "graph_iso": iso, "spectral_similarity": round(spec, 4)}
 
 
+def canonical_workflow_code(source: str) -> str | None:
+    """Represent only instantiated PE roles and their directed connections."""
+    graph = extract_graph(source)
+    if not graph["parse_ok"]:
+        return None
+
+    roles = graph["node_roles"]
+    edges = graph["edges"]
+    canonical_ids = _canonical_ids(roles, edges)
+    nodes = sorted(((canonical_ids[i], role or "UnknownPE")
+                    for i, role in enumerate(roles)))
+    canonical_edges = sorted((canonical_ids[src], _port_key(src_port),
+                              canonical_ids[dst], _port_key(dst_port))
+                             for src, src_port, dst, dst_port in edges)
+
+    lines = [f"node_{node_id} = {role}()" for node_id, role in nodes]
+    lines.append("graph = WorkflowGraph()")
+    for src, src_port, dst, dst_port in canonical_edges:
+        # Stable placeholder ports ensure ignored port names cannot influence
+        # CodeBLEU while retaining the shape of a real connect call.
+        if not STRICT_PORTS:
+            src_port, dst_port = "output", "input"
+        lines.append(
+            f"graph.connect(node_{src}, {src_port!r}, node_{dst}, {dst_port!r})"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def codebleu_score(answer: str, ground_truth: str) -> float:
+    """Run CodeBLEU on canonical workflow structure, excluding incidental code."""
+    answer_workflow = canonical_workflow_code(answer)
+    truth_workflow = canonical_workflow_code(ground_truth)
+    if answer_workflow is None or truth_workflow is None:
+        return NAN
+    if not answer_workflow.strip() or not truth_workflow.strip():
+        return float(answer_workflow == truth_workflow)
+    try:
+        scores = calc_codebleu(
+            references=[truth_workflow],
+            predictions=[answer_workflow],
+            lang="python",
+            weights=CODEBLEU_WEIGHTS,
+            tokenizer=None,
+        )
+    except Exception:
+        return NAN
+    # Calculate this explicitly because some wrappers replace a zero data-flow
+    # component with one, which inflates the published CodeBLEU formula.
+    return sum(weight * scores[key]
+               for weight, key in zip(CODEBLEU_WEIGHTS, CODEBLEU_COMPONENTS))
+
+
 def structural_scores(answer: str, ground_truth: str) -> dict:
     g = extract_graph(answer)
     t = extract_graph(ground_truth)
@@ -372,7 +432,7 @@ def _blank_row(task: str) -> dict:
     return {"task": task, "status": None, "error": "", "seconds": 0.0,
             "parse_ok": 0.0, "topology_f1": 0.0, "role_edge_f1": 0.0,
             "stage_count_ok": 0.0, "ged": NAN, "ged_similarity": 0.0,
-            "graph_iso": 0.0, "spectral_similarity": 0.0}
+            "graph_iso": 0.0, "spectral_similarity": 0.0, "codebleu": NAN}
 
 
 def run_evaluation(generate_fn: Callable[[str], str], truth_dir: str, descr_dir: str,
@@ -403,6 +463,7 @@ def run_evaluation(generate_fn: Callable[[str], str], truth_dir: str, descr_dir:
             else:
                 scores = structural_scores_multi(str(code), [truth_code])
                 row.update(scores)
+                row["codebleu"] = codebleu_score(str(code), truth_code)
                 row["status"] = STATUS_OK if scores["parse_ok"] else STATUS_SYNTAX
         except Exception as e:
             row["seconds"] = time.perf_counter() - t0
@@ -436,6 +497,7 @@ def aggregate(results: list[dict]) -> dict:
         "mean_ged_similarity": mean("ged_similarity", parsed),
         "graph_iso_rate": mean("graph_iso", parsed),
         "mean_spectral_similarity": mean("spectral_similarity", parsed),
+        "mean_codebleu": mean("codebleu", results),
         "total_seconds": sum(r["seconds"] for r in results),
         "n_parsed": len(parsed),
     }
@@ -493,6 +555,7 @@ def per_task_stats(all_results: list[list[dict]]) -> list[dict]:
         ged = [r["ged"] for r in parsed]
         spec = [r["spectral_similarity"] for r in parsed]
         iso = [r["graph_iso"] for r in parsed]
+        codebleu = [r["codebleu"] for r in rows]
         secs = [r["seconds"] for r in rows]
         out.append({
             "task": task, "n": len(rows),
@@ -505,6 +568,7 @@ def per_task_stats(all_results: list[list[dict]]) -> list[dict]:
             "gsim_mean": mean_or0(gsim), "gsim_std": std_or0(gsim),
             "spec_mean": mean_or0(spec), "spec_std": std_or0(spec),
             "iso_rate": mean_or0(iso),
+            "codebleu_mean": mean_or0(codebleu), "codebleu_std": std_or0(codebleu),
             "time_mean": mean_or0(secs), "time_std": std_or0(secs),
         })
     return out
@@ -512,8 +576,8 @@ def per_task_stats(all_results: list[list[dict]]) -> list[dict]:
 
 _SUMMARY_KEYS = ["syntactic_validity_rate", "mean_topology_f1", "median_topology_f1",
                  "mean_role_edge_f1", "stage_count_pass_rate",
-                 "mean_ged", "mean_ged_similarity", "graph_iso_rate",
-                 "mean_spectral_similarity", "total_seconds", "n_parsed"]
+                  "mean_ged", "mean_ged_similarity", "graph_iso_rate",
+                  "mean_spectral_similarity", "mean_codebleu", "total_seconds", "n_parsed"]
 
 
 def summarize_runs(all_results: list[list[dict]]) -> dict:
@@ -546,8 +610,9 @@ def save_multi_reports(all_results: list[list[dict]], out_dir: str) -> tuple[str
 
     fields = ["task", "n", "ok", "parse_rate", "topo_mean", "topo_std",
               "role_mean", "role_std", "stage_rate",
-              "ged_mean", "ged_std", "gsim_mean", "gsim_std",
-              "spec_mean", "spec_std", "iso_rate", "time_mean", "time_std"]
+               "ged_mean", "ged_std", "gsim_mean", "gsim_std",
+               "spec_mean", "spec_std", "iso_rate", "codebleu_mean", "codebleu_std",
+               "time_mean", "time_std"]
     with open(csv_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
@@ -653,7 +718,7 @@ def print_multi_summary(all_results: list[list[dict]]) -> None:
     summ = summarize_runs(all_results)
     cols = [("Task", 22), ("n", 4), ("OK", 4), ("parse%", 7),
             ("topo_f1 μ±σ", 15), ("role_f1 μ±σ", 15),
-            ("ged μ±σ", 15), ("spec μ±σ", 15), ("iso%", 6),
+            ("CodeBLEU μ±σ", 15), ("ged μ±σ", 15), ("spec μ±σ", 15), ("iso%", 6),
             ("stage%", 7), ("time μ", 8)]
     header = "  ".join(name.ljust(w) for name, w in cols)
     print("\n" + header)
@@ -664,6 +729,7 @@ def print_multi_summary(all_results: list[list[dict]]) -> None:
             f"{s['parse_rate'] * 100:.0f}%".ljust(7),
             f"{s['topo_mean']:.3f}±{s['topo_std']:.3f}".ljust(15),
             f"{s['role_mean']:.3f}±{s['role_std']:.3f}".ljust(15),
+            f"{s['codebleu_mean']:.3f}±{s['codebleu_std']:.3f}".ljust(15),
             f"{s['ged_mean']:.2f}±{s['ged_std']:.2f}".ljust(15),
             f"{s['spec_mean']:.3f}±{s['spec_std']:.3f}".ljust(15),
             f"{s['iso_rate'] * 100:.0f}%".ljust(6),
@@ -682,7 +748,7 @@ def print_multi_summary(all_results: list[list[dict]]) -> None:
           f"validity {pm('syntactic_validity_rate', pct=True)}   "
           f"stage-pass {pm('stage_count_pass_rate', pct=True)}")
     print(f"topology_f1 {pm('mean_topology_f1')}   role_edge_f1 {pm('mean_role_edge_f1')}   "
-          f"time/run {pm('total_seconds', prec=1)}s")
+          f"CodeBLEU {pm('mean_codebleu')}   time/run {pm('total_seconds', prec=1)}s")
     if USE_GRAPH_SIM:
         print(f"ged {pm('mean_ged', prec=2)}   ged_sim {pm('mean_ged_similarity')}   "
               f"iso {pm('graph_iso_rate', pct=True)}   spectral {pm('mean_spectral_similarity')}")
@@ -693,7 +759,8 @@ def print_multi_summary(all_results: list[list[dict]]) -> None:
 def run_headless(generate_fn, truth_dir, descr_dir, runs, out_dir, save):
     def task_cb(ri, row):
         print(f"  run {ri + 1}/{runs} [{row['status']:<10}] {row['task']:<22} "
-              f"topo={row['topology_f1']:.3f} ged={_fmt_ged(row['ged'])} "
+              f"topo={row['topology_f1']:.3f} CodeBLEU={row['codebleu']:.3f} "
+              f"ged={_fmt_ged(row['ged'])} "
               f"({row['seconds']:.1f}s)")
 
     def run_done_cb(ri, res):
@@ -828,7 +895,7 @@ class EvalApp(App):
     def on_mount(self) -> None:
         t = self.query_one("#results", DataTable)
         t.add_columns("Task", "n", "OK", "parse%", "topo_f1 μ±σ", "role_f1 μ±σ",
-                      "ged μ±σ", "spec μ±σ", "iso%", "stage%", "time μ")
+                      "CodeBLEU μ±σ", "ged μ±σ", "spec μ±σ", "iso%", "stage%", "time μ")
         self.query_one("#progress", ProgressBar).update(total=100, progress=0)
         note = "ports: strict" if STRICT_PORTS else "ports: ignored"
         if not USE_GRAPH_SIM:
@@ -921,7 +988,8 @@ class EvalApp(App):
                 "EMPTY": "[yellow]·[/]", "GEN_ERROR": "[red]✗[/]"}.get(row["status"], "?")
         self.query_one("#events", RichLog).write(
             f"{mark} run {ri + 1}/{runs} [b]{row['task']}[/] {row['status']} "
-            f"topo={row['topology_f1']:.3f} ged={_fmt_ged(row['ged'])} "
+            f"topo={row['topology_f1']:.3f} CodeBLEU={row['codebleu']:.3f} "
+            f"ged={_fmt_ged(row['ged'])} "
             f"({row['seconds']:.1f}s)")
 
     def _refresh(self, all_results) -> None:
@@ -933,6 +1001,7 @@ class EvalApp(App):
                 f"{s['parse_rate'] * 100:.0f}%",
                 _pm_text(s["topo_mean"], s["topo_std"]),
                 _pm_text(s["role_mean"], s["role_std"]),
+                _pm_text(s["codebleu_mean"], s["codebleu_std"]),
                 _dist_text(s["ged_mean"], s["ged_std"]),
                 _pm_text(s["spec_mean"], s["spec_std"]),
                 _rate_text(s["iso_rate"]),
@@ -956,6 +1025,7 @@ class EvalApp(App):
             part("validity", "syntactic_validity_rate", pct=True),
             part("topo_f1", "mean_topology_f1"),
             part("role_f1", "mean_role_edge_f1"),
+            part("CodeBLEU", "mean_codebleu"),
             part("stage-pass", "stage_count_pass_rate", pct=True),
         ])
         if USE_GRAPH_SIM:
